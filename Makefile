@@ -931,15 +931,6 @@ endif
 	$(call if_changed_rule,vmlinux__)
 	$(Q)rm -f .old_version
 
-# build vmlinux.o first to catch section mismatch errors early
-ifdef CONFIG_KALLSYMS
-.tmp_vmlinux1: vmlinux.o
-endif
-
-modpost-init := $(filter-out init/built-in.o, $(vmlinux-init))
-vmlinux.o: $(modpost-init) $(vmlinux-main) FORCE
-	$(call if_changed_rule,vmlinux-modpost)
-
 # The actual objects are generated when descending, 
 # make sure no implicit rule kicks in
 $(sort $(vmlinux-init) $(vmlinux-main)) $(vmlinux-lds): $(vmlinux-dirs) ;
