@@ -941,6 +941,15 @@ $(sort $(vmlinux-init) $(vmlinux-main)) $(vmlinux-lds): $(vmlinux-dirs) ;
 # make menuconfig etc.
 # Error messages still appears in the original language
 
+# build vmlinux.o first to catch section mismatch errors early
+ifdef CONFIG_KALLSYMS
+.tmp_vmlinux1: vmlinux.o
+endif
+
+ modpost-init := $(filter-out init/built-in.o, $(vmlinux-init))
+ vmlinux.o: $(modpost-init) $(vmlinux-main) FORCE
+#	$(call if_changed_rule,vmlinux-modpost)
+
 PHONY += $(vmlinux-dirs)
 $(vmlinux-dirs): prepare scripts
 	$(Q)$(MAKE) $(build)=$@
