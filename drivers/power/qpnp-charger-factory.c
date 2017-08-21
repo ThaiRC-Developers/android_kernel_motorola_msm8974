@@ -30,8 +30,6 @@
 #include <linux/regulator/of_regulator.h>
 #include <linux/regulator/machine.h>
 #include <linux/of_batterydata.h>
-#include <linux/gpio.h>
-#include <linux/of_gpio.h>
 
 /* Interrupt offsets */
 #define INT_RT_STS(base)			(base + 0x10)
@@ -298,8 +296,6 @@ struct qpnp_chg_chip {
 	bool				btc_disabled;
 	bool				use_default_batt_values;
 	bool				duty_cycle_100p;
-	bool				factory_cable_present;
-	bool				no_factory_kill_ic;
 	unsigned int			bpd_detection;
 	unsigned int			max_bat_chg_current;
 	unsigned int			warm_bat_chg_ma;
@@ -344,7 +340,6 @@ struct qpnp_chg_chip {
 	struct qpnp_vadc_chip		*vadc_dev;
 	struct qpnp_adc_tm_chip		*adc_tm_dev;
 	struct mutex			jeita_configure_lock;
-	int factory_detect_gpio;
 };
 
 
@@ -944,10 +939,6 @@ qpnp_chg_usb_usbin_valid_irq_handler(int irq, void *_chip)
 			chip->chg_done = false;
 			chip->prev_usb_max_ma = -EINVAL;
 		} else {
-			if (chip->no_factory_kill_ic
-				&& !chip->factory_cable_present)
-				chip->factory_cable_present = true;
-
 			schedule_delayed_work(&chip->eoc_work,
 				msecs_to_jiffies(EOC_CHECK_PERIOD_MS));
 		}
@@ -1496,8 +1487,7 @@ static int get_prop_online(struct qpnp_chg_chip *chip)
 {
 	return qpnp_chg_is_batfet_closed(chip);
 }
-static int factory_kill_disable;
-module_param(factory_kill_disable, int, 0644);
+
 static void
 qpnp_batt_external_power_changed(struct power_supply *psy)
 {
@@ -1507,6 +1497,9 @@ qpnp_batt_external_power_changed(struct power_supply *psy)
 
 	if (!chip->bms_psy)
 		chip->bms_psy = power_supply_get_by_name("bms");
+
+	chip->usb_psy->get_property(chip->usb_psy,
+			  POWER_SUPPLY_PROP_ONLINE, &ret);
 
 	/* Only honour requests while USB is present */
 	if (qpnp_chg_is_usb_chg_plugged_in(chip)) {
@@ -1531,11 +1524,6 @@ qpnp_batt_external_power_changed(struct power_supply *psy)
 			}
 		}
 		chip->prev_usb_max_ma = ret.intval;
-	} else if (chip->no_factory_kill_ic && chip->factory_cable_present
-							&& !factory_kill_disable) {
-		pr_err("External Power Changed: USB cable was removed\n");
-		kernel_power_off();
-		return;
 	}
 
 skip_set_iusb_max:
@@ -2678,8 +2666,7 @@ qpnp_chg_load_battery_data(struct qpnp_chg_chip *chip)
 		}
 
 		rc = of_batterydata_read_data(node,
-					      &batt_data, result.physical,
-					      NULL);
+				&batt_data, result.physical);
 		if (rc) {
 			pr_err("failed to read battery data: %d\n", rc);
 			return 0;
@@ -3006,11 +2993,6 @@ qpnp_charger_read_dt_props(struct qpnp_chg_chip *chip)
 
 	if (rc)
 		return rc;
-
-	chip->factory_detect_gpio = of_get_named_gpio(chip->spmi->dev.of_node,
-						"qcom,factory_detect_gpio", 0);
-	if (chip->factory_detect_gpio < 0)
-		pr_debug("factory_detect_gpio is not available\n");
 
 	rc = of_property_read_string(chip->spmi->dev.of_node,
 		"qcom,bpd-detection", &bpd);
@@ -3521,23 +3503,11 @@ static DEVICE_ATTR(force_chg_usb_otg_ctl, 0664,
 		   force_chg_usb_otg_ctl_store);
 
 
-static ssize_t id_state_show(struct device *dev,
-		struct device_attribute *attr, char *buf)
-{
-	struct qpnp_chg_chip *chip = the_chip;
-	int id = 0;
-	if ((chip->factory_detect_gpio))
-		id = gpio_get_value(chip->factory_detect_gpio);
-
-	return snprintf(buf, PAGE_SIZE, "%d\n", !!id);
-}
-static DEVICE_ATTR(id_state, S_IRUGO, id_state_show, NULL);
-
 static int qpnp_charging_reboot(struct notifier_block *nb,
 				unsigned long event, void *unused)
 {
 	struct qpnp_vadc_result res;
-#define VBUS_OFF_THRESHOLD 2000000
+#define VBUS_OFF_THRESHOLD 900000
 
 	/*
 	 * Hack to power down when both VBUS and BPLUS are present.
@@ -3565,8 +3535,7 @@ static int qpnp_charging_reboot(struct notifier_block *nb,
 				pr_err("VBUS ADC read error\n");
 				break;
 			} else
-				pr_info("VBUS:= %lld microVolts\n",
-							res.physical);
+				pr_info("VBUS:= %lld mV\n", res.physical);
 			msleep(100);
 		} while (res.physical > VBUS_OFF_THRESHOLD);
 
@@ -3588,15 +3557,6 @@ static bool __devinit qpnp_charger_mmi_factory(void)
 	of_node_put(np);
 
 	return factory;
-}
-
-static void qpnp_charger_mmi_no_fact_kill_ic(struct qpnp_chg_chip *chip)
-{
-	struct device_node *np = of_find_node_by_path("/chosen");
-
-	if (np && of_find_property(np, "mmi,no-factory-kill-ic", NULL))
-		chip->no_factory_kill_ic = true;
-	of_node_put(np);
 }
 
 static int __devinit
@@ -3623,8 +3583,6 @@ qpnp_charger_fac_probe(struct spmi_device *spmi)
 	chip->prev_usb_max_ma = -EINVAL;
 	chip->dev = &(spmi->dev);
 	chip->spmi = spmi;
-	chip->factory_cable_present = false;
-	chip->no_factory_kill_ic = false;
 
 	chip->usb_psy = power_supply_get_by_name("usb");
 	if (!chip->usb_psy) {
@@ -3639,14 +3597,6 @@ qpnp_charger_fac_probe(struct spmi_device *spmi)
 	if (rc)
 		goto fail_chg_enable;
 
-	if (gpio_is_valid(chip->factory_detect_gpio)) {
-		rc = gpio_request(chip->factory_detect_gpio,
-						"USB_ID_GPIO");
-		if (rc < 0) {
-			dev_err(&spmi->dev, "gpio req failed for id\n");
-			chip->factory_detect_gpio = 0;
-		}
-	}
 	/*
 	 * Check if bat_if is set in DT and make sure VADC is present
 	 * Also try loading the battery data profile if bat_if exists
@@ -3931,22 +3881,10 @@ qpnp_charger_fac_probe(struct spmi_device *spmi)
 	power_supply_set_present(chip->usb_psy,
 			qpnp_chg_is_usb_chg_plugged_in(chip));
 
-	qpnp_charger_mmi_no_fact_kill_ic(chip);
-
 	/* Set USB psy online to avoid userspace from shutting down if battery
 	 * capacity is at zero and no chargers online. */
-	if (qpnp_chg_is_usb_chg_plugged_in(chip)) {
+	if (qpnp_chg_is_usb_chg_plugged_in(chip))
 		power_supply_set_online(chip->usb_psy, 1);
-
-		if (chip->no_factory_kill_ic)
-			chip->factory_cable_present = true;
-	}
-	if (gpio_is_valid(chip->factory_detect_gpio))
-		rc = device_create_file(&spmi->dev, &dev_attr_id_state);
-
-	if (rc)
-		pr_err("couldn't create id_state\n");
-
 
 	rc = device_create_file(&spmi->dev,
 				&dev_attr_force_chg_auto_enable);
@@ -4048,11 +3986,6 @@ qpnp_charger_fac_remove(struct spmi_device *spmi)
 	device_remove_file(&spmi->dev, &dev_attr_force_chg_itrick);
 	device_remove_file(&spmi->dev, &dev_attr_force_chg_fail_clear);
 	device_remove_file(&spmi->dev, &dev_attr_force_chg_usb_otg_ctl);
-
-	if (gpio_is_valid(chip->factory_detect_gpio)) {
-		device_remove_file(&spmi->dev, &dev_attr_id_state);
-		gpio_free(chip->factory_detect_gpio);
-	}
 	dev_set_drvdata(&spmi->dev, NULL);
 	unregister_reboot_notifier(&qpnp_charging_reboot_notifier);
 	kfree(chip);
